@@ -17,6 +17,7 @@ Env vars required (set these in Render's dashboard, never hardcode them):
 """
 
 import os
+import asyncio
 from aiohttp import web
 import aiohttp
 from pyrogram import Client
@@ -90,7 +91,11 @@ async def webhook_handler(request):
         return web.Response(text="ok")
 
     file_id = media["file_id"]
-    file_database[msg_id] = file_id
+    file_database[msg_id] = {
+        "file_id": file_id,
+        "file_size": media.get("file_size", 0),
+        "mime_type": media.get("mime_type", "video/mp4"),
+    }
 
     stream_url = f"{WEBHOOK_URL}/stream/{msg_id}"
     reply_text = (
@@ -109,16 +114,63 @@ async def stream_handler(request):
     if msg_id not in file_database:
         return web.Response(text="File Link Expired or Not Found", status=404)
 
-    file_id = file_database[msg_id]
+    entry = file_database[msg_id]
+    file_id = entry["file_id"]
+    file_size = entry.get("file_size") or 0
+    mime_type = entry.get("mime_type") or "video/mp4"
 
-    response = web.StreamResponse(
-        status=200,
-        headers={"Content-Type": "video/mp4", "Accept-Ranges": "bytes"},
-    )
+    CHUNK_SIZE = 1024 * 1024  # Pyrogram streams in fixed 1MiB chunks
+
+    range_header = request.headers.get("Range")
+    start = 0
+    end = file_size - 1 if file_size else None
+
+    if range_header and file_size:
+        # Expected form: "bytes=START-END" (END is optional)
+        try:
+            units, rng = range_header.split("=")
+            range_start, range_end = rng.split("-")
+            start = int(range_start)
+            end = int(range_end) if range_end else file_size - 1
+        except (ValueError, IndexError):
+            start, end = 0, file_size - 1
+
+    status = 206 if range_header and file_size else 200
+    headers = {
+        "Content-Type": mime_type,
+        "Accept-Ranges": "bytes",
+    }
+    if file_size:
+        content_length = end - start + 1
+        headers["Content-Length"] = str(content_length)
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+    response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
 
-    async for chunk in pyro_app.stream_media(file_id):
-        await response.write(chunk)
+    start_chunk = start // CHUNK_SIZE
+    skip_in_first_chunk = start - (start_chunk * CHUNK_SIZE)
+    bytes_remaining = (end - start + 1) if file_size else None
+
+    try:
+        first = True
+        async for chunk in pyro_app.stream_media(file_id, offset=start_chunk):
+            if first:
+                chunk = chunk[skip_in_first_chunk:]
+                first = False
+
+            if bytes_remaining is not None:
+                if bytes_remaining <= 0:
+                    break
+                if len(chunk) > bytes_remaining:
+                    chunk = chunk[:bytes_remaining]
+                bytes_remaining -= len(chunk)
+
+            await response.write(chunk)
+    except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+        # The client (VLC) closed or seeked away mid-stream - not an error worth logging loudly
+        pass
 
     return response
 
